@@ -92,6 +92,23 @@ hb_verifier -m model_quantized_model.onnx,model.bin -s True
 
 ---
 
+## 🧹 换模型清理
+
+> 🔴 **血泪教训：清理命令必须在宿主机执行，禁止在 Docker 容器内执行！**
+> 容器内 `/workspace` 挂载了宿主机目录，容器里删 = 宿主机丢。先 `exit` 退出容器再清理。
+
+换新 `best.pt` 后，**在宿主机**执行：
+
+```bash
+cd ~/Desktop/x5_work
+rm -f best.pt best.onnx yolo_config.yaml preprocess.py *.html
+rm -rf model_output/ calibration_data/ calibration_images/ yolov5/
+```
+
+> 详见 [README.md](./README.md)「换模型 / 清理旧文件」章节。
+
+---
+
 ## 🐞 常见坑速查
 
 | # | 症状 | 解法 |

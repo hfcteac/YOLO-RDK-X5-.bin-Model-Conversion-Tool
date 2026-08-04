@@ -85,6 +85,7 @@ docker pull openexplorer/ai_toolchain_ubuntu_20_x5_cpu:v1.2.8
 
 > ⚠️ **关键**：不能用 `ultralytics` 包加载 YOLOv5 模型！必须用 yolov5 仓库原生工具。
 
+
 ```bash
 # 工作目录
 mkdir -p /home/hafeizhou/Desktop/x5_work
@@ -269,17 +270,70 @@ EOF
 
 ---
 
-### 4. 校准数据准备（可选，先 skip 可以跳过）
+### 4. 校准数据准备
 
-> 如果 `calibration_type: "skip"`，跳过本节，直接第 5 步。
+#### 4.0 先搞懂：什么时候需要校准？
 
-从训练集挑 **100 张典型图片**，放到宿主机 `/home/hafeizhou/Desktop/x5_work/calibration_images/`。
+`calibration_type` 有两个值，不同阶段用不同的：
 
-在容器内预处理：
+| 值 | 含义 | 精度 | 速度 | 适用场景 |
+|----|------|:---:|:---:|---------|
+| `"skip"` | 跳过校准，用默认参数直接量化 | ⭐⭐ | 快 | 第 1 次跑，验证转换流程能不能通 |
+| `"default"` | 用校准数据指导量化 | ⭐⭐⭐ | 慢（多几分钟） | 正式部署，追求板端精度 |
+
+**推荐路线**：先 `"skip"` 快速出一版 `.bin` 跑通流程 → 再 `"default"` 出正式版。
+
+> 如果你现在 yaml 里写的是 `calibration_type: "skip"`，且你只是想先验证转换能不能通，**直接跳到第 5 步**，本节不用看。
+
+---
+
+#### 4.1 准备校准图片（宿主机操作）
+
+校准需要 **100 张左右**能代表你实际场景的图片。图片要求：
+
+- 格式：`.jpg` / `.jpeg` / `.png` / `.bmp`
+- 尺寸：不限（脚本会自动 resize 到 640×640）
+- 数量：建议 100~200 张，最少 50 张
+- 来源：从训练集/测试集里随机挑，或者用实际场景拍的照片
+
+**⚠️ 在宿主机执行**，把图片放到这个目录：
 
 ```bash
+mkdir -p /home/hafeizhou/Desktop/x5_work/calibration_images
+# 然后用文件管理器拖进去，或者 cp 进来
+# 比如：cp /path/to/your/images/*.jpg /home/hafeizhou/Desktop/x5_work/calibration_images/
+```
+
+确认图片数量：
+
+```bash
+ls /home/hafeizhou/Desktop/x5_work/calibration_images/ | wc -l
+```
+
+> 注意：如果你是**第 2 次跑校准**（之前跑过一次 skip 或之前校准过），先清掉旧的：
+> ```bash
+> rm -rf /home/hafeizhou/Desktop/x5_work/calibration_data/
+> ```
+
+---
+
+#### 4.2 启动容器并预处理图片
+
+**进入容器**：
+
+```bash
+docker run -it --rm \
+  -v /home/hafeizhou/Desktop/x5_work:/workspace \
+  openexplorer/ai_toolchain_ubuntu_20_x5_cpu:v1.2.8
+```
+
+**在容器内**执行以下命令（全部复制，一次粘贴进去）：
+
+```bash
+# 1. 创建校准数据输出目录
 mkdir -p /workspace/calibration_data
 
+# 2. 写预处理脚本（把 jpg/png 转成工具链要求的 .bin 格式）
 cat > /workspace/preprocess.py << 'PYEOF'
 import os, cv2
 import numpy as np
@@ -294,10 +348,15 @@ for fname in sorted(os.listdir(src_dir)):
         continue
     img = cv2.imread(os.path.join(src_dir, fname))
     if img is None:
+        print(f"  [跳过] 无法读取: {fname}")
         continue
+    # resize 到 640x640（和模型输入一致）
     img = cv2.resize(img, (640, 640))
+    # BGR → RGB（训练时用的是 RGB）
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # 转 float32（不做归一化，工具链内部会处理）
     img = img.astype(np.float32)
+    # 保存为 .bin（地平线工具链要求 raw binary 格式）
     img.tofile(os.path.join(dst_dir, fname.rsplit('.', 1)[0] + '.bin'))
     count += 1
     print(f"[{count}] Processed: {fname}")
@@ -305,10 +364,80 @@ for fname in sorted(os.listdir(src_dir)):
 print(f"\nDone! {count} files saved to {dst_dir}")
 PYEOF
 
+# 3. 运行预处理脚本
 python3 preprocess.py
 ```
 
-然后把 yaml 里的 `calibration_type` 改成 `"default"`，重新跑 `hb_mapper makertbin`。
+**预期输出**：
+
+```
+[1] Processed: img001.jpg
+[2] Processed: img002.jpg
+...
+[100] Processed: img100.jpg
+
+Done! 100 files saved to /workspace/calibration_data
+```
+
+确认生成的文件：
+
+```bash
+ls /workspace/calibration_data/ | wc -l   # 应该等于你的图片数量
+ls /workspace/calibration_data/ | head -5  # 看前 5 个文件名
+```
+
+---
+
+#### 4.3 改 YAML 配置
+
+把 yaml 里的 `calibration_type` 从 `"skip"` 改成 `"default"`。
+
+用 `sed` 一键改（在容器内执行）：
+
+```bash
+sed -i 's/calibration_type: "skip"/calibration_type: "default"/' /workspace/yolo_config.yaml
+```
+
+或者手动编辑：
+
+```bash
+vi /workspace/yolo_config.yaml
+# 找到 calibration_type: "skip" → 改成 calibration_type: "default"
+# :wq 保存退出
+```
+
+确认改对了：
+
+```bash
+grep calibration_type /workspace/yolo_config.yaml
+# 应该输出：  calibration_type: "default"
+```
+
+---
+
+#### 4.4 重新转换（这一次带校准）
+
+```bash
+cd /workspace
+hb_mapper makertbin --config yolo_config.yaml --model-type onnx
+```
+
+命令和之前一样，但这次它会读 `calibration_data/` 里的数据来优化量化参数，运行时间比 `skip` 模式长几分钟（100 张图大约多 2~5 分钟）。
+
+**完成后**，`.bin` 在 `model_output/` 下，直接跳到第 5.5 节去验证。
+
+---
+
+#### 4.5 快捷命令汇总（不想理解原理的看这里）
+
+| 步骤 | 在哪执行 | 命令 |
+|------|---------|------|
+| 放图片 | 宿主机 | 把 100 张 jpg 拖进 `~/Desktop/x5_work/calibration_images/` |
+| 进容器 | 宿主机 | `docker run -it --rm -v ~/Desktop/x5_work:/workspace openexplorer/ai_toolchain_ubuntu_20_x5_cpu:v1.2.8` |
+| 预处理 | 容器内 | `mkdir -p /workspace/calibration_data && python3 preprocess.py`（先 cat 写脚本） |
+| 改 yaml | 容器内 | `sed -i 's/"skip"/"default"/' /workspace/yolo_config.yaml` |
+| 重新转换 | 容器内 | `hb_mapper makertbin --config yolo_config.yaml --model-type onnx` |
+| 验证 | 容器内 | `cd model_output && hb_verifier -m model_quantized_model.onnx,model.bin -s True` |
 
 ---
 
@@ -433,6 +562,88 @@ hrt_model_exec perf --model_file /userdata/best_640x640_nv12.bin --core_id 0 --t
 
 ---
 
+## 🧹 换模型 / 清理旧文件（一键干净重来）
+
+> 🔴🔴🔴 **血泪警告：以下所有 rm 命令必须在 Ubuntu 宿主机执行，绝对不能在 Docker 容器内执行！！！**
+> 
+> Docker 启动时 `-v ~/Desktop/x5_work:/workspace` 挂载了目录，容器内的 `/workspace` **就是**宿主机的 `x5_work`。
+> 在容器内执行 `rm -rf /workspace/*` = 删除宿主机上的所有模型文件，**不可逆**。
+> 
+> **判断你在哪里**：看终端提示符——
+> - `hafeizhou@hafeizhou-virtual-machine:~$` → ✅ 宿主机，安全
+> - `root@f88672e3a538:/workspace#` → ❌ Docker 容器内，**立刻停手，先 exit 退出！**
+
+当你训练了新模型、换了 `best.pt`，需要把旧模型的残留文件清掉再重新转换。
+
+### 哪些文件需要清理？
+
+| 位置 | 文件/目录 | 说明 |
+|------|-----------|------|
+| 宿主机 `~/Desktop/x5_work/` | `best.pt`、`best.onnx` | 旧模型权重和 ONNX |
+| 宿主机 `~/Desktop/x5_work/` | `yolo_config.yaml` | 旧转换配置 |
+| 宿主机 `~/Desktop/x5_work/` | `model_output/` | 旧 .bin 产出 |
+| 宿主机 `~/Desktop/x5_work/` | `calibration_data/`、`calibration_images/` | 旧校准数据 |
+| 宿主机 `~/Desktop/x5_work/` | `yolov5/` | 旧 yolov5 仓库（含中间文件） |
+| 宿主机 `~/Desktop/x5_work/` | `*.html` | 旧性能报告 |
+| Docker 容器 | 容器实例 | 退出即清（`--rm` 参数） |
+
+### 一键清理脚本
+
+> ⚠️ **再次确认**：看到 `hafeizhou@` 开头的提示符才能执行！如果是 `root@` 开头，先 `exit` 退出容器！
+
+```bash
+# 在宿主机执行！！！不要进容器！！！
+cd ~/Desktop/x5_work
+
+# === 清旧模型文件 ===
+rm -f best.pt best.onnx
+
+# === 清转换产出 ===
+rm -rf model_output/
+
+# === 清校准数据 ===
+rm -rf calibration_data/ calibration_images/
+
+# === 清中间配置文件 ===
+rm -f yolo_config.yaml preprocess.py
+rm -f *.html
+
+# === 清 yolov5 仓库（下次会自动 git clone 新的）===
+rm -rf yolov5/
+
+# === 确认清理结果 ===
+echo "=== 清理完毕，当前目录内容 ==="
+ls -la
+```
+
+### 清理后重新转换的步骤
+
+```bash
+# 1. 把新 best.pt 放进工作目录
+cp /path/to/new_best.pt ~/Desktop/x5_work/best.pt
+
+# 2. 重新跑 PT → ONNX（按你的路线选择）
+#    YOLOv5：按「第一篇」步骤 2
+#    Ultralytics：按「第二篇」步骤 2
+
+# 3. 重新跑 Checker → makertbin（按「第三篇」步骤）
+```
+
+### Docker 容器清理（可选）
+
+```bash
+# 查看暂停/退出的容器
+docker ps -a
+
+# 清所有已退出容器
+docker container prune -f
+
+# 清未使用的镜像（慎用，会删掉工具链镜像）
+# docker image prune -a
+```
+
+---
+
 # 附录
 
 ## A. 完整操作流程速查
@@ -470,6 +681,7 @@ flowchart TD
 | 11 | Checker | opset 18 > 11 | 重新导出，确保 opset=11 |
 | 12 | YAML | `compiler_parameters` 不认 `march`/`working_dir` | `march` 放 `model_parameters`，不要 `compiler_parameters` 段 |
 | 13 | YAML | `input_shape` 用逗号分隔报错 | 改用 `x`：`1x3x640x640` |
+| 🔴 14 | 清理 | **在 Docker 容器内执行 rm -rf 删光了宿主机文件** | 清理命令只能在宿主机执行，容器内 `/workspace` 就是挂载的宿主机目录。先 `exit` 退出容器再清理！ |
 
 ## C. 参考链接
 
